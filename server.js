@@ -130,6 +130,7 @@ async function notify(s) {
   const text = SYMBOL + ' ' + s.signal + '\nEntry ' + f(s.entry) + '\nSL ' + f(s.sl) +
     '\nTP1 ' + f(s.tp1) + '\nTP2 ' + f(s.tp2) + '\nM15 candle ' + s.candle;
   console.log(text);
+  fetch('https://ntfy.sh/' + (process.env.NTFY_TOPIC || 'xauusd-signals-k7x92q'), { method: 'POST', body: text, headers: { Title: SYMBOL + ' ' + s.signal, Priority: 'high' } }).catch(e => console.error('ntfy error', e.message));
   if (!TG_TOKEN || !TG_CHAT) return;
   try {
     await fetch('https://api.telegram.org/bot' + TG_TOKEN + '/sendMessage', {

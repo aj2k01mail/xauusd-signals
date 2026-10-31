@@ -1,4 +1,4 @@
-// XAUUSD live signal server. Node 18+, no dependencies.
+// XAUUSD signal server v2. Node 18+, no dependencies.
 const http = require('http');
 
 const KEY = process.env.TWELVEDATA_KEY;
@@ -7,8 +7,16 @@ const SYMBOL = process.env.SYMBOL || 'XAU/USD';
 const TG_TOKEN = process.env.TELEGRAM_TOKEN;
 const TG_CHAT = process.env.TELEGRAM_CHAT;
 const SESSION = (process.env.SESSION_UTC || '7-20').split('-').map(Number);
-// Example: NEWS_BLOCKS="2026-10-29 12:30-13:30,2026-11-06 13:00-14:00" (UTC)
+// Example: NEWS_BLOCKS="2026-11-06 13:00-14:30,2026-11-11 13:00-14:30" (UTC)
 const NEWS = (process.env.NEWS_BLOCKS || '').split(',').map(s => s.trim()).filter(Boolean);
+const MAX_DIST = Number(process.env.MAX_DIST || 10);       // max price distance for SL and TP2
+const SPREAD = Number(process.env.SPREAD || 0.3);          // typical spread plus slippage in price
+const MAX_PER_DAY = Number(process.env.MAX_PER_DAY || 3);  // max signals per UTC day
+const COOLDOWN = Number(process.env.COOLDOWN || 4);        // candles to wait after a signal
+const FRI_CUTOFF = Number(process.env.FRI_CUTOFF_UTC || 18);
+const MIN_ATR = Number(process.env.MIN_ATR || 0.8);        // skip dead markets
+const BAR = 15 * 60000;
+const RR1 = 2, RR2 = 3;
 
 if (!KEY) { console.error('Set TWELVEDATA_KEY'); process.exit(1); }
 
@@ -41,6 +49,12 @@ function pivots(b, k, L) {
   return { ph, pl };
 }
 
+function trendOf(arr, fast, slow) {
+  const c = arr.map(x => x.c), sl = Math.min(slow, c.length - 1);
+  const ef = ema(c, fast), es = ema(c, sl), last = c[c.length - 1];
+  return ef > es && last > ef ? 'BUY' : ef < es && last < ef ? 'SELL' : 'NONE';
+}
+
 // ---------- data ----------
 async function candles(interval, size, ms) {
   const url = 'https://api.twelvedata.com/time_series?symbol=' + encodeURIComponent(SYMBOL) +
@@ -54,17 +68,15 @@ async function candles(interval, size, ms) {
       t: Date.parse(v.datetime.replace(' ', 'T') + 'Z'),
       o: +v.open, h: +v.high, l: +v.low, c: +v.close
     }))
-    .filter(b => b.t + ms <= now); // keep closed candles only
+    .filter(b => b.t + ms <= now); // closed candles only
 }
 
-// ---------- strategy ----------
-function analyze(B, H) {
+// ---------- strategy (pure function, also used by backtest) ----------
+function analyze(B, H4, H1, nowMs) {
   const k = B.length - 1, last = B[k], prev = B[k - 1];
   const a = atr(B, 14), zone = a * 0.5, tick = 0.01;
-  const hc = H.map(x => x.c), slen = Math.min(200, H.length - 1);
-  const ef = ema(hc, 50), es = ema(hc, slen), hl = hc[hc.length - 1];
-  const up = ef > es && hl > ef, down = ef < es && hl < ef;
-  const dir = up ? 'BUY' : down ? 'SELL' : 'NONE';
+  const dir = trendOf(H4, 50, 200);
+  const h1ok = dir !== 'NONE' && trendOf(H1, 21, 50) === dir;
   const pv = pivots(B, k, 5);
 
   const body = Math.abs(last.c - last.o);
@@ -75,19 +87,24 @@ function analyze(B, H) {
   const bearC = (last.c < last.o && prev.c > prev.o && last.c <= prev.o && last.o >= prev.c) ||
                 (uw >= 2 * Math.max(body, tick) && uw >= 2 * lw);
 
-  const now = new Date(), hr = now.getUTCHours();
-  const sessOk = hr >= SESSION[0] && hr < SESSION[1];
+  const sigT = last.t + BAR, d = new Date(sigT), hr = d.getUTCHours(), day = d.getUTCDay();
+  const weekdayOk = day >= 1 && day <= 5;
+  const fridayOk = !(day === 5 && hr >= FRI_CUTOFF);
+  const sessOk = weekdayOk && fridayOk && hr >= SESSION[0] && hr < SESSION[1];
   const newsOk = !NEWS.some(s => {
-    const [d, r] = s.split(' '); const [x, y] = r.split('-');
-    return now >= Date.parse(d + 'T' + x + ':00Z') && now <= Date.parse(d + 'T' + y + ':00Z');
+    const [dd, r] = s.split(' '); const [x, y] = r.split('-');
+    return sigT >= Date.parse(dd + 'T' + x + ':00Z') && sigT <= Date.parse(dd + 'T' + y + ':00Z');
   });
-  const fresh = Date.now() - last.t < 45 * 60000;
+  const fresh = nowMs - last.t < 45 * 60000;
+  const atrOk = a >= MIN_ATR;
 
   const checks = [];
   checks.push({ name: 'Data fresh', pass: fresh, note: fresh ? 'Live candles' : 'Market closed or stale data' });
-  checks.push({ name: 'Trend (H4)', pass: dir !== 'NONE', note: (up ? 'Uptrend' : down ? 'Downtrend' : 'Range') });
+  checks.push({ name: 'Trend (H4)', pass: dir !== 'NONE', note: dir === 'BUY' ? 'Uptrend' : dir === 'SELL' ? 'Downtrend' : 'Range' });
+  checks.push({ name: 'Trend (H1)', pass: h1ok, note: h1ok ? 'Agrees with H4' : 'Does not agree' });
+  checks.push({ name: 'Volatility', pass: atrOk, note: 'ATR ' + a.toFixed(2) + ' (min ' + MIN_ATR + ')' });
 
-  let lvl = false, cnd = false, sl = 0, risk = 0, rOk = false;
+  let lvl = false, cnd = false, sl = 0, risk = 0, rOk = false, maxRisk = 0, minRisk = SPREAD * 5;
   if (dir === 'BUY') {
     lvl = pv.pl !== null && last.l <= pv.pl + zone && last.l >= pv.pl - zone && last.c > pv.pl;
     cnd = bullC;
@@ -100,15 +117,16 @@ function analyze(B, H) {
     risk = sl - last.c;
   }
   if (dir !== 'NONE') {
-    rOk = risk > 0 && risk <= a * 3;
+    maxRisk = Math.min(a * 3, MAX_DIST / RR2);
+    rOk = risk >= minRisk && risk <= maxRisk;
     checks.push({ name: 'Level retest', pass: lvl, note: dir === 'BUY' ? 'Swing low ' + pv.pl : 'Swing high ' + pv.ph });
     checks.push({ name: 'Candle', pass: cnd, note: 'Pin bar or engulfing' });
-    checks.push({ name: 'Risk size', pass: rOk, note: 'Stop ' + risk.toFixed(2) + ' (max ' + (a * 3).toFixed(2) + ')' });
+    checks.push({ name: 'Risk size', pass: rOk, note: 'Stop ' + risk.toFixed(2) + ' (min ' + minRisk.toFixed(2) + ', max ' + maxRisk.toFixed(2) + ')' });
   }
-  checks.push({ name: 'Session', pass: sessOk, note: 'UTC ' + SESSION[0] + ':00 to ' + SESSION[1] + ':00' });
+  checks.push({ name: 'Session', pass: sessOk, note: !weekdayOk ? 'Weekend, market closed' : !fridayOk ? 'Friday cutoff' : 'UTC ' + SESSION[0] + ':00 to ' + SESSION[1] + ':00' });
   checks.push({ name: 'News', pass: newsOk, note: newsOk ? 'No blocked window' : 'Inside news window' });
 
-  const ok = fresh && dir !== 'NONE' && lvl && cnd && rOk && sessOk && newsOk;
+  const ok = fresh && dir !== 'NONE' && h1ok && atrOk && lvl && cnd && rOk && sessOk && newsOk;
   const e = last.c, s = dir === 'BUY' ? 1 : -1;
   return {
     signal: ok ? dir : 'NO TRADE',
@@ -117,18 +135,109 @@ function analyze(B, H) {
     price: e,
     entry: ok ? e : null,
     sl: ok ? sl : null,
-    tp1: ok ? e + s * risk * 2 : null,
-    tp2: ok ? e + s * risk * 3 : null,
+    tp1: ok ? e + s * risk * RR1 : null,
+    tp2: ok ? e + s * risk * RR2 : null,
     checks,
     updated: new Date().toISOString()
   };
+}
+
+// ---------- trade simulation (live tracking and backtest) ----------
+// Plan: close half at TP1, move stop to entry, rest runs to TP2.
+function evalTrade(tr, C, maxBars) {
+  const s = tr.dir === 'BUY' ? 1 : -1;
+  const risk = Math.abs(tr.entry - tr.sl);
+  const cost = SPREAD / risk;
+  const n = Math.min(C.length, maxBars);
+  let stage = 0;
+  for (let i = 0; i < n; i++) {
+    const b = C[i];
+    const hitSl = s === 1 ? b.l <= tr.sl : b.h >= tr.sl;
+    const hit1 = s === 1 ? b.h >= tr.tp1 : b.l <= tr.tp1;
+    const hit2 = s === 1 ? b.h >= tr.tp2 : b.l <= tr.tp2;
+    const hitBe = s === 1 ? b.l <= tr.entry : b.h >= tr.entry;
+    if (stage === 0) {
+      if (hitSl) return { done: true, stage, r: -1 - cost, bars: i + 1, out: 'SL' };
+      if (hit2) return { done: true, stage, r: 0.5 * RR1 + 0.5 * RR2 - cost, bars: i + 1, out: 'TP2' };
+      if (hit1) stage = 1;
+    } else {
+      if (hitBe) return { done: true, stage, r: 0.5 * RR1 - cost, bars: i + 1, out: 'BE' };
+      if (hit2) return { done: true, stage, r: 0.5 * RR1 + 0.5 * RR2 - cost, bars: i + 1, out: 'TP2' };
+    }
+  }
+  if (C.length >= maxBars && n > 0) {
+    const u = ((C[n - 1].c - tr.entry) * s) / risk;
+    const r = stage === 1 ? 0.5 * RR1 + 0.5 * u : u;
+    return { done: true, stage, r: r - cost, bars: n, out: 'TIMEOUT' };
+  }
+  return { done: false, stage };
+}
+
+function stats(list) {
+  const c = list.filter(t => t.done);
+  const rs = c.map(t => t.r);
+  const wins = rs.filter(r => r > 0), losses = rs.filter(r => r <= 0);
+  const total = rs.reduce((x, y) => x + y, 0);
+  const gw = wins.reduce((x, y) => x + y, 0), gl = Math.abs(losses.reduce((x, y) => x + y, 0));
+  let peak = 0, eq = 0, dd = 0;
+  rs.forEach(r => { eq += r; peak = Math.max(peak, eq); dd = Math.max(dd, peak - eq); });
+  return {
+    trades: c.length,
+    winRate: c.length ? +(wins.length / c.length * 100).toFixed(1) : 0,
+    totalR: +total.toFixed(2),
+    avgR: c.length ? +(total / c.length).toFixed(2) : 0,
+    profitFactor: gl ? +(gw / gl).toFixed(2) : null,
+    maxDrawdownR: +dd.toFixed(2)
+  };
+}
+
+// ---------- backtest ----------
+const upto = (arr, ms, t, n) => arr.filter(b => b.t + ms <= t).slice(-n);
+let btCache = null;
+
+async function backtest() {
+  if (btCache && Date.now() - btCache.at < 3600000) return btCache.data;
+  const [B, H4, H1] = await Promise.all([
+    candles('15min', 5000, BAR),
+    candles('4h', 1500, 4 * 3600000),
+    candles('1h', 3000, 3600000)
+  ]);
+  const trades = [], perDay = {};
+  let i = 200;
+  while (i < B.length - 2) {
+    const w = B.slice(i - 149, i + 1);
+    const t = w[w.length - 1].t + BAR;
+    const h4 = upto(H4, 4 * 3600000, t, 260), h1 = upto(H1, 3600000, t, 120);
+    if (h4.length < 60 || h1.length < 60) { i++; continue; }
+    const sg = analyze(w, h4, h1, t);
+    const dk = new Date(t).toISOString().slice(0, 10);
+    if (sg.signal !== 'NO TRADE' && (perDay[dk] || 0) < MAX_PER_DAY) {
+      const tr = { dir: sg.signal, entry: sg.entry, sl: sg.sl, tp1: sg.tp1, tp2: sg.tp2 };
+      const res = evalTrade(tr, B.slice(i + 1, i + 97), 96);
+      if (!res.done) break;
+      perDay[dk] = (perDay[dk] || 0) + 1;
+      trades.push({ time: sg.candle, dir: tr.dir, entry: +tr.entry.toFixed(2), sl: +tr.sl.toFixed(2), out: res.out, r: +res.r.toFixed(2), done: true });
+      i += res.bars + COOLDOWN;
+    } else {
+      i++;
+    }
+  }
+  const data = {
+    note: 'Backtest on recent M15 candles. Includes spread cost. Past results do not guarantee future results.',
+    from: new Date(B[0].t).toISOString(),
+    to: new Date(B[B.length - 1].t).toISOString(),
+    summary: stats(trades),
+    last30: trades.slice(-30)
+  };
+  btCache = { at: Date.now(), data };
+  return data;
 }
 
 // ---------- alerts ----------
 async function notify(s) {
   const f = x => x.toFixed(2);
   const text = SYMBOL + ' ' + s.signal + '\nEntry ' + f(s.entry) + '\nSL ' + f(s.sl) +
-    '\nTP1 ' + f(s.tp1) + '\nTP2 ' + f(s.tp2) + '\nM15 candle ' + s.candle;
+    '\nTP1 ' + f(s.tp1) + ' (close half, move SL to entry)\nTP2 ' + f(s.tp2) + '\nM15 candle ' + s.candle;
   console.log(text);
   fetch('https://ntfy.sh/' + (process.env.NTFY_TOPIC || 'xauusd-signals-k7x92q'), { method: 'POST', body: text, headers: { Title: SYMBOL + ' ' + s.signal, Priority: 'high' } }).catch(e => console.error('ntfy error', e.message));
   if (!TG_TOKEN || !TG_CHAT) return;
@@ -143,21 +252,46 @@ async function notify(s) {
 
 // ---------- loop ----------
 let state = { signal: 'STARTING', checks: [] };
-let history = [], lastBoundary = 0, lastAlertT = 0;
+let trades = [], lastBoundary = 0, lastAlertT = 0;
 
 async function refresh() {
   try {
-    const [B, H] = await Promise.all([
-      candles('15min', 150, 15 * 60000),
-      candles('4h', 260, 4 * 3600000)
+    const [B, H4, H1] = await Promise.all([
+      candles('15min', 150, BAR),
+      candles('4h', 260, 4 * 3600000),
+      candles('1h', 120, 3600000)
     ]);
-    if (B.length < 40 || H.length < 60) throw new Error('Not enough candles from API');
-    state = analyze(B, H);
-    if (state.signal !== 'NO TRADE' && state.candleTime !== lastAlertT) {
-      lastAlertT = state.candleTime;
-      history.unshift(state);
-      history = history.slice(0, 20);
-      await notify(state);
+    if (B.length < 40 || H4.length < 60 || H1.length < 60) throw new Error('Not enough candles from API');
+
+    // update open trades
+    trades.forEach(tr => {
+      if (tr.done) return;
+      const res = evalTrade(tr, B.filter(b => b.t > tr.candleTime), 96);
+      Object.assign(tr, res);
+    });
+
+    const s = analyze(B, H4, H1, Date.now());
+
+    if (s.signal !== 'NO TRADE') {
+      const dk = s.candle.slice(0, 10);
+      const today = trades.filter(t => t.candle.slice(0, 10) === dk).length;
+      let why = '';
+      if (s.candleTime - lastAlertT < COOLDOWN * BAR) why = 'Cooldown after last signal';
+      else if (today >= MAX_PER_DAY) why = 'Daily signal limit reached';
+      if (why) {
+        s.checks.push({ name: 'Limits', pass: false, note: why });
+        s.signal = 'NO TRADE'; s.entry = s.sl = s.tp1 = s.tp2 = null;
+      } else {
+        s.checks.push({ name: 'Limits', pass: true, note: today + ' of ' + MAX_PER_DAY + ' today' });
+      }
+    }
+    state = s;
+
+    if (s.signal !== 'NO TRADE' && s.candleTime !== lastAlertT) {
+      lastAlertT = s.candleTime;
+      trades.unshift({ dir: s.signal, entry: s.entry, sl: s.sl, tp1: s.tp1, tp2: s.tp2, candleTime: s.candleTime, candle: s.candle, done: false, stage: 0 });
+      trades = trades.slice(0, 50);
+      await notify(s);
     }
   } catch (e) {
     state = Object.assign({}, state, { error: e.message, updated: new Date().toISOString() });
@@ -185,9 +319,11 @@ main{max-width:560px;margin:0 auto;padding:20px 16px}
 dl{display:grid;grid-template-columns:auto 1fr;gap:4px 14px}dt{color:#93a3b5}dd{margin:0;font-weight:600}
 li{list-style:none;padding:6px 0;border-top:1px solid #2b3a4c}ul{padding:0;margin:8px 0 0}
 .p{color:#4cc98a}.f{color:#ff8077}.m{color:#93a3b5;font-size:.85rem}
+a{color:#7fb4ff}
 </style></head><body><main>
 <h1>XAUUSD Live Signal</h1><div id="o" class="c">Loading...</div>
-<p class="m">Checks the last closed M15 candle. Education only, not financial advice.</p>
+<div id="t" class="c"></div>
+<p class="m"><a href="/api/backtest">Run backtest</a> (takes a few seconds). Checks the last closed M15 candle. Education only, not financial advice.</p>
 <script>
 function f(x){return x==null?'-':x.toFixed(2)}
 function load(){fetch('/api/signal').then(function(r){return r.json()}).then(function(s){
@@ -196,14 +332,27 @@ var h='<p class="v '+cls+'">'+s.signal+'</p><div class="m">Price '+f(s.price)+' 
 if(s.entry!=null){h+='<dl><dt>Entry</dt><dd>'+f(s.entry)+'</dd><dt>Stop loss</dt><dd>'+f(s.sl)+'</dd><dt>TP1 (1:2)</dt><dd>'+f(s.tp1)+'</dd><dt>TP2 (1:3)</dt><dd>'+f(s.tp2)+'</dd></dl>'}
 if(s.error){h+='<p class="f">API error: '+s.error+'</p>'}
 h+='<ul>'+(s.checks||[]).map(function(c){return '<li><b class="'+(c.pass?'p':'f')+'">'+(c.pass?'Pass':'Fail')+'</b> '+c.name+' <span class="m">'+c.note+'</span></li>'}).join('')+'</ul>';
-document.getElementById('o').innerHTML=h})}
+document.getElementById('o').innerHTML=h;
+var st=s.stats||{};
+var t='<b>Live results since server start</b><div class="m">Trades '+(st.trades||0)+' | Win rate '+(st.winRate||0)+'% | Total '+(st.totalR||0)+'R | Max drawdown '+(st.maxDrawdownR||0)+'R</div><ul>'+(s.trades||[]).slice(0,10).map(function(x){return '<li><b class="'+(x.dir==='BUY'?'BUY':'SELL')+'">'+x.dir+'</b> '+f(x.entry)+' <span class="m">'+(x.done?(x.out+' '+f(x.r)+'R'):(x.stage===1?'Open, TP1 hit':'Open'))+'</span></li>'}).join('')+'</ul>';
+document.getElementById('t').innerHTML=t})}
 load();setInterval(load,30000);
 </script></main></body></html>`;
 
-http.createServer((req, res) => {
+http.createServer(async (req, res) => {
   if (req.url.startsWith('/api/signal')) {
     res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
-    return res.end(JSON.stringify(Object.assign({}, state, { history })));
+    return res.end(JSON.stringify(Object.assign({}, state, { trades, stats: stats(trades) })));
+  }
+  if (req.url.startsWith('/api/backtest')) {
+    try {
+      const data = await backtest();
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+      return res.end(JSON.stringify(data, null, 2));
+    } catch (e) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ error: e.message }));
+    }
   }
   if (req.url === '/health') { res.writeHead(200); return res.end('ok'); }
   res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });

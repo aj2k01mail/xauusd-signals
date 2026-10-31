@@ -1,4 +1,4 @@
-// XAUUSD signal server v2.1 (with backtest funnel). Node 18+, no dependencies.
+// XAUUSD signal server v2.2 (tunable backtest). Node 18+, no dependencies.
 const http = require('http');
 
 const KEY = process.env.TWELVEDATA_KEY;
@@ -9,14 +9,24 @@ const TG_CHAT = process.env.TELEGRAM_CHAT;
 const SESSION = (process.env.SESSION_UTC || '7-20').split('-').map(Number);
 // Example: NEWS_BLOCKS="2026-11-06 13:00-14:30,2026-11-11 13:00-14:30" (UTC)
 const NEWS = (process.env.NEWS_BLOCKS || '').split(',').map(s => s.trim()).filter(Boolean);
-const MAX_DIST = Number(process.env.MAX_DIST || 10);       // max price distance for SL and TP2
-const SPREAD = Number(process.env.SPREAD || 0.3);          // typical spread plus slippage in price
-const MAX_PER_DAY = Number(process.env.MAX_PER_DAY || 3);  // max signals per UTC day
-const COOLDOWN = Number(process.env.COOLDOWN || 4);        // candles to wait after a signal
-const FRI_CUTOFF = Number(process.env.FRI_CUTOFF_UTC || 18);
-const MIN_ATR = Number(process.env.MIN_ATR || 0.8);        // skip dead markets
 const BAR = 15 * 60000;
-const RR1 = 2, RR2 = 3;
+
+// Default settings. The backtest link can override most of them, for example:
+// /api/backtest?h1=0&zone=1&rr1=1.5&rr2=2&maxdist=10
+const DEF = {
+  maxDist: Number(process.env.MAX_DIST || 10),      // max price distance for SL and TP2
+  rr1: Number(process.env.RR1 || 1.5),              // TP1 as multiple of risk
+  rr2: Number(process.env.RR2 || 2),                // TP2 as multiple of risk
+  spread: Number(process.env.SPREAD || 0.3),        // spread plus slippage in price
+  minAtr: Number(process.env.MIN_ATR || 0.8),       // skip dead markets
+  h1: Number(process.env.USE_H1 || 1),              // 1 = H1 trend must agree, 0 = ignore H1
+  zone: Number(process.env.ZONE || 0.5),            // level retest zone in ATR
+  slbuf: Number(process.env.SL_BUF || 0.3),         // stop buffer in ATR
+  maxAtr: Number(process.env.MAX_ATR_MULT || 3),    // stop cannot exceed this many ATR
+  maxPerDay: Number(process.env.MAX_PER_DAY || 3),  // max signals per UTC day
+  cooldown: Number(process.env.COOLDOWN || 4),      // candles to wait after a signal
+  friCutoff: Number(process.env.FRI_CUTOFF_UTC || 18)
+};
 
 if (!KEY) { console.error('Set TWELVEDATA_KEY'); process.exit(1); }
 
@@ -72,11 +82,11 @@ async function candles(interval, size, ms) {
 }
 
 // ---------- strategy (pure function, also used by backtest) ----------
-function analyze(B, H4, H1, nowMs) {
+function analyze(B, H4, H1, nowMs, C) {
   const k = B.length - 1, last = B[k], prev = B[k - 1];
-  const a = atr(B, 14), zone = a * 0.5, tick = 0.01;
+  const a = atr(B, 14), zone = a * C.zone, tick = 0.01;
   const dir = trendOf(H4, 50, 200);
-  const h1ok = dir !== 'NONE' && trendOf(H1, 21, 50) === dir;
+  const h1ok = dir !== 'NONE' && (C.h1 ? trendOf(H1, 21, 50) === dir : true);
   const pv = pivots(B, k, 5);
 
   const body = Math.abs(last.c - last.o);
@@ -89,35 +99,36 @@ function analyze(B, H4, H1, nowMs) {
 
   const sigT = last.t + BAR, d = new Date(sigT), hr = d.getUTCHours(), day = d.getUTCDay();
   const weekdayOk = day >= 1 && day <= 5;
-  const fridayOk = !(day === 5 && hr >= FRI_CUTOFF);
+  const fridayOk = !(day === 5 && hr >= C.friCutoff);
   const sessOk = weekdayOk && fridayOk && hr >= SESSION[0] && hr < SESSION[1];
   const newsOk = !NEWS.some(s => {
     const [dd, r] = s.split(' '); const [x, y] = r.split('-');
     return sigT >= Date.parse(dd + 'T' + x + ':00Z') && sigT <= Date.parse(dd + 'T' + y + ':00Z');
   });
   const fresh = nowMs - last.t < 45 * 60000;
-  const atrOk = a >= MIN_ATR;
+  const atrOk = a >= C.minAtr;
 
   const checks = [];
   checks.push({ name: 'Data fresh', pass: fresh, note: fresh ? 'Live candles' : 'Market closed or stale data' });
   checks.push({ name: 'Trend (H4)', pass: dir !== 'NONE', note: dir === 'BUY' ? 'Uptrend' : dir === 'SELL' ? 'Downtrend' : 'Range' });
-  checks.push({ name: 'Trend (H1)', pass: h1ok, note: h1ok ? 'Agrees with H4' : 'Does not agree' });
-  checks.push({ name: 'Volatility', pass: atrOk, note: 'ATR ' + a.toFixed(2) + ' (min ' + MIN_ATR + ')' });
+  checks.push({ name: 'Trend (H1)', pass: h1ok, note: !C.h1 ? 'Not required' : h1ok ? 'Agrees with H4' : 'Does not agree' });
+  checks.push({ name: 'Volatility', pass: atrOk, note: 'ATR ' + a.toFixed(2) + ' (min ' + C.minAtr + ')' });
 
-  let lvl = false, cnd = false, sl = 0, risk = 0, rOk = false, maxRisk = 0, minRisk = SPREAD * 5;
+  let lvl = false, cnd = false, sl = 0, risk = 0, rOk = false, maxRisk = 0;
+  const minRisk = C.spread * 5;
   if (dir === 'BUY') {
     lvl = pv.pl !== null && last.l <= pv.pl + zone && last.l >= pv.pl - zone && last.c > pv.pl;
     cnd = bullC;
-    sl = Math.min(last.l, pv.pl === null ? last.l : pv.pl) - a * 0.3;
+    sl = Math.min(last.l, pv.pl === null ? last.l : pv.pl) - a * C.slbuf;
     risk = last.c - sl;
   } else if (dir === 'SELL') {
     lvl = pv.ph !== null && last.h >= pv.ph - zone && last.h <= pv.ph + zone && last.c < pv.ph;
     cnd = bearC;
-    sl = Math.max(last.h, pv.ph === null ? last.h : pv.ph) + a * 0.3;
+    sl = Math.max(last.h, pv.ph === null ? last.h : pv.ph) + a * C.slbuf;
     risk = sl - last.c;
   }
   if (dir !== 'NONE') {
-    maxRisk = Math.min(a * 3, MAX_DIST / RR2);
+    maxRisk = Math.min(a * C.maxAtr, C.maxDist / C.rr2);
     rOk = risk >= minRisk && risk <= maxRisk;
     checks.push({ name: 'Level retest', pass: lvl, note: dir === 'BUY' ? 'Swing low ' + pv.pl : 'Swing high ' + pv.ph });
     checks.push({ name: 'Candle', pass: cnd, note: 'Pin bar or engulfing' });
@@ -135,11 +146,12 @@ function analyze(B, H4, H1, nowMs) {
     price: e,
     entry: ok ? e : null,
     sl: ok ? sl : null,
-    tp1: ok ? e + s * risk * RR1 : null,
-    tp2: ok ? e + s * risk * RR2 : null,
+    tp1: ok ? e + s * risk * C.rr1 : null,
+    tp2: ok ? e + s * risk * C.rr2 : null,
     riskVal: dir !== 'NONE' ? risk : null,
     maxRisk: maxRisk,
     minRisk: minRisk,
+    atrVal: a,
     checks,
     updated: new Date().toISOString()
   };
@@ -147,30 +159,31 @@ function analyze(B, H4, H1, nowMs) {
 
 // ---------- trade simulation (live tracking and backtest) ----------
 // Plan: close half at TP1, move stop to entry, rest runs to TP2.
-function evalTrade(tr, C, maxBars) {
+function evalTrade(tr, cd, maxBars, C) {
   const s = tr.dir === 'BUY' ? 1 : -1;
   const risk = Math.abs(tr.entry - tr.sl);
-  const cost = SPREAD / risk;
-  const n = Math.min(C.length, maxBars);
+  const cost = C.spread / risk;
+  const full = 0.5 * C.rr1 + 0.5 * C.rr2;
+  const n = Math.min(cd.length, maxBars);
   let stage = 0;
   for (let i = 0; i < n; i++) {
-    const b = C[i];
+    const b = cd[i];
     const hitSl = s === 1 ? b.l <= tr.sl : b.h >= tr.sl;
     const hit1 = s === 1 ? b.h >= tr.tp1 : b.l <= tr.tp1;
     const hit2 = s === 1 ? b.h >= tr.tp2 : b.l <= tr.tp2;
     const hitBe = s === 1 ? b.l <= tr.entry : b.h >= tr.entry;
     if (stage === 0) {
       if (hitSl) return { done: true, stage, r: -1 - cost, bars: i + 1, out: 'SL' };
-      if (hit2) return { done: true, stage, r: 0.5 * RR1 + 0.5 * RR2 - cost, bars: i + 1, out: 'TP2' };
+      if (hit2) return { done: true, stage, r: full - cost, bars: i + 1, out: 'TP2' };
       if (hit1) stage = 1;
     } else {
-      if (hitBe) return { done: true, stage, r: 0.5 * RR1 - cost, bars: i + 1, out: 'BE' };
-      if (hit2) return { done: true, stage, r: 0.5 * RR1 + 0.5 * RR2 - cost, bars: i + 1, out: 'TP2' };
+      if (hitBe) return { done: true, stage, r: 0.5 * C.rr1 - cost, bars: i + 1, out: 'BE' };
+      if (hit2) return { done: true, stage, r: full - cost, bars: i + 1, out: 'TP2' };
     }
   }
-  if (C.length >= maxBars && n > 0) {
-    const u = ((C[n - 1].c - tr.entry) * s) / risk;
-    const r = stage === 1 ? 0.5 * RR1 + 0.5 * u : u;
+  if (cd.length >= maxBars && n > 0) {
+    const u = ((cd[n - 1].c - tr.entry) * s) / risk;
+    const r = stage === 1 ? 0.5 * C.rr1 + 0.5 * u : u;
     return { done: true, stage, r: r - cost, bars: n, out: 'TIMEOUT' };
   }
   return { done: false, stage };
@@ -196,17 +209,39 @@ function stats(list) {
 
 // ---------- backtest ----------
 const upto = (arr, ms, t, n) => arr.filter(b => b.t + ms <= t).slice(-n);
-let btCache = null;
+const pick = (arr, p) => arr.length ? +arr[Math.min(arr.length - 1, Math.floor(arr.length * p))].toFixed(2) : null;
+let dataCache = null;
+let btCache = {};
 
-async function backtest() {
-  if (btCache && Date.now() - btCache.at < 3600000) return btCache.data;
+async function loadBtData() {
+  if (dataCache && Date.now() - dataCache.at < 3600000) return dataCache;
   const [B, H4, H1] = await Promise.all([
     candles('15min', 5000, BAR),
     candles('4h', 1500, 4 * 3600000),
     candles('1h', 3000, 3600000)
   ]);
-  const trades = [], perDay = {};
-  // Funnel: counts only candles inside the trading session, to show which filter blocks signals.
+  dataCache = { at: Date.now(), B, H4, H1 };
+  btCache = {};
+  return dataCache;
+}
+
+function cfgFromUrl(url) {
+  const q = new URL(url, 'http://x').searchParams;
+  const cfg = Object.assign({}, DEF);
+  const map = { maxdist: 'maxDist', rr1: 'rr1', rr2: 'rr2', spread: 'spread', minatr: 'minAtr', h1: 'h1', zone: 'zone', slbuf: 'slbuf', maxatr: 'maxAtr' };
+  Object.keys(map).forEach(k => {
+    if (q.has(k) && q.get(k) !== '' && !isNaN(Number(q.get(k)))) cfg[map[k]] = Number(q.get(k));
+  });
+  return cfg;
+}
+
+async function backtest(cfg) {
+  const key = JSON.stringify(cfg);
+  const data0 = await loadBtData();
+  if (btCache[key]) return btCache[key];
+  const { B, H4, H1 } = data0;
+  const trades = [], perDay = {}, riskSamples = [], atrSamples = [];
+  // Funnel counts only candles inside the trading session, to show which filter blocks signals.
   const funnel = {
     candlesChecked: 0, sessionCandles: 0,
     trendH4: 0, trendH1: 0, volatility: 0, levelRetest: 0, candlePattern: 0, riskSize: 0,
@@ -219,7 +254,7 @@ async function backtest() {
     const t = w[w.length - 1].t + BAR;
     const h4 = upto(H4, 4 * 3600000, t, 260), h1 = upto(H1, 3600000, t, 120);
     if (h4.length < 60 || h1.length < 60) { i++; continue; }
-    const sg = analyze(w, h4, h1, t);
+    const sg = analyze(w, h4, h1, t, cfg);
 
     funnel.candlesChecked++;
     const pass = n => { const c = sg.checks.find(x => x.name === n); return !!(c && c.pass); };
@@ -233,6 +268,8 @@ async function backtest() {
       if (pass('Risk size')) funnel.riskSize++;
       if (pass('Level retest') && pass('Candle')) {
         funnel.levelAndCandle++;
+        riskSamples.push(sg.riskVal);
+        atrSamples.push(sg.atrVal);
         if (pass('Trend (H4)') && pass('Trend (H1)')) funnel.trendLevelCandle++;
         if (sg.riskVal > sg.maxRisk) funnel.levelCandleButRiskTooBig++;
         else if (sg.riskVal < sg.minRisk) funnel.levelCandleButRiskTooSmall++;
@@ -241,26 +278,34 @@ async function backtest() {
     }
 
     const dk = new Date(t).toISOString().slice(0, 10);
-    if (sg.signal !== 'NO TRADE' && (perDay[dk] || 0) < MAX_PER_DAY) {
+    if (sg.signal !== 'NO TRADE' && (perDay[dk] || 0) < cfg.maxPerDay) {
       const tr = { dir: sg.signal, entry: sg.entry, sl: sg.sl, tp1: sg.tp1, tp2: sg.tp2 };
-      const res = evalTrade(tr, B.slice(i + 1, i + 97), 96);
+      const res = evalTrade(tr, B.slice(i + 1, i + 97), 96, cfg);
       if (!res.done) break;
       perDay[dk] = (perDay[dk] || 0) + 1;
       trades.push({ time: sg.candle, dir: tr.dir, entry: +tr.entry.toFixed(2), sl: +tr.sl.toFixed(2), out: res.out, r: +res.r.toFixed(2), done: true });
-      i += res.bars + COOLDOWN;
+      i += res.bars + cfg.cooldown;
     } else {
       i++;
     }
   }
+  riskSamples.sort((x, y) => x - y);
+  atrSamples.sort((x, y) => x - y);
+  funnel.riskStats = {
+    note: 'Stop distance of candles that had level retest and candle pattern',
+    min: pick(riskSamples, 0), median: pick(riskSamples, 0.5), p75: pick(riskSamples, 0.75), max: pick(riskSamples, 0.999),
+    atrMedian: pick(atrSamples, 0.5)
+  };
   const data = {
-    note: 'Backtest on recent M15 candles. Includes spread cost. Past results do not guarantee future results.',
+    note: 'Backtest on recent M15 candles. Includes spread cost. Past results do not guarantee future results. Under 30 trades is too few to trust.',
+    config: cfg,
     from: new Date(B[0].t).toISOString(),
     to: new Date(B[B.length - 1].t).toISOString(),
     summary: stats(trades),
     funnel,
     last30: trades.slice(-30)
   };
-  btCache = { at: Date.now(), data };
+  btCache[key] = data;
   return data;
 }
 
@@ -297,23 +342,23 @@ async function refresh() {
     // update open trades
     trades.forEach(tr => {
       if (tr.done) return;
-      const res = evalTrade(tr, B.filter(b => b.t > tr.candleTime), 96);
+      const res = evalTrade(tr, B.filter(b => b.t > tr.candleTime), 96, DEF);
       Object.assign(tr, res);
     });
 
-    const s = analyze(B, H4, H1, Date.now());
+    const s = analyze(B, H4, H1, Date.now(), DEF);
 
     if (s.signal !== 'NO TRADE') {
       const dk = s.candle.slice(0, 10);
       const today = trades.filter(t => t.candle.slice(0, 10) === dk).length;
       let why = '';
-      if (s.candleTime - lastAlertT < COOLDOWN * BAR) why = 'Cooldown after last signal';
-      else if (today >= MAX_PER_DAY) why = 'Daily signal limit reached';
+      if (s.candleTime - lastAlertT < DEF.cooldown * BAR) why = 'Cooldown after last signal';
+      else if (today >= DEF.maxPerDay) why = 'Daily signal limit reached';
       if (why) {
         s.checks.push({ name: 'Limits', pass: false, note: why });
         s.signal = 'NO TRADE'; s.entry = s.sl = s.tp1 = s.tp2 = null;
       } else {
-        s.checks.push({ name: 'Limits', pass: true, note: today + ' of ' + MAX_PER_DAY + ' today' });
+        s.checks.push({ name: 'Limits', pass: true, note: today + ' of ' + DEF.maxPerDay + ' today' });
       }
     }
     state = s;
@@ -360,7 +405,7 @@ function f(x){return x==null?'-':x.toFixed(2)}
 function load(){fetch('/api/signal').then(function(r){return r.json()}).then(function(s){
 var cls=s.signal==='BUY'?'BUY':s.signal==='SELL'?'SELL':'NO';
 var h='<p class="v '+cls+'">'+s.signal+'</p><div class="m">Price '+f(s.price)+' | Candle '+(s.candle||'-')+'</div>';
-if(s.entry!=null){h+='<dl><dt>Entry</dt><dd>'+f(s.entry)+'</dd><dt>Stop loss</dt><dd>'+f(s.sl)+'</dd><dt>TP1 (1:2)</dt><dd>'+f(s.tp1)+'</dd><dt>TP2 (1:3)</dt><dd>'+f(s.tp2)+'</dd></dl>'}
+if(s.entry!=null){h+='<dl><dt>Entry</dt><dd>'+f(s.entry)+'</dd><dt>Stop loss</dt><dd>'+f(s.sl)+'</dd><dt>TP1</dt><dd>'+f(s.tp1)+'</dd><dt>TP2</dt><dd>'+f(s.tp2)+'</dd></dl>'}
 if(s.error){h+='<p class="f">API error: '+s.error+'</p>'}
 h+='<ul>'+(s.checks||[]).map(function(c){return '<li><b class="'+(c.pass?'p':'f')+'">'+(c.pass?'Pass':'Fail')+'</b> '+c.name+' <span class="m">'+c.note+'</span></li>'}).join('')+'</ul>';
 document.getElementById('o').innerHTML=h;
@@ -377,7 +422,7 @@ http.createServer(async (req, res) => {
   }
   if (req.url.startsWith('/api/backtest')) {
     try {
-      const data = await backtest();
+      const data = await backtest(cfgFromUrl(req.url));
       res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
       return res.end(JSON.stringify(data, null, 2));
     } catch (e) {

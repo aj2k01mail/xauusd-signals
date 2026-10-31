@@ -1,4 +1,4 @@
-// XAUUSD signal server v2.3 (sweep with train/test split). Node 18+, no dependencies.
+// XAUUSD signal server v2.4 (chart with volume profile and pivot levels). Node 18+, no dependencies.
 const http = require('http');
 
 const KEY = process.env.TWELVEDATA_KEY;
@@ -10,21 +10,26 @@ const SESSION = (process.env.SESSION_UTC || '7-20').split('-').map(Number);
 // Example: NEWS_BLOCKS="2026-11-06 13:00-14:30,2026-11-11 13:00-14:30" (UTC)
 const NEWS = (process.env.NEWS_BLOCKS || '').split(',').map(s => s.trim()).filter(Boolean);
 const BAR = 15 * 60000;
+const PIVOT_LEN = Number(process.env.PIVOT_LEN || 10);        // chart pivot length
+const PIVOT_FILTER = Number(process.env.PIVOT_FILTER || 20);  // chart pivot min volume percent
+const VP_PERIOD = Number(process.env.VP_PERIOD || 200);       // volume profile candles
+const VP_BINS = Number(process.env.VP_BINS || 50);            // volume profile resolution
 
 // Default settings. Backtest and sweep links can override them.
 const DEF = {
-  maxDist: Number(process.env.MAX_DIST || 10),      // max price distance for SL and TP2
+  maxDist: Number(process.env.MAX_DIST || 30),      // max price distance for SL and TP2
   rr1: Number(process.env.RR1 || 1.5),              // TP1 as multiple of risk
   rr2: Number(process.env.RR2 || 2),                // TP2 as multiple of risk
   spread: Number(process.env.SPREAD || 0.3),        // spread plus slippage in price
   minAtr: Number(process.env.MIN_ATR || 0.8),       // skip dead markets
-  h1: Number(process.env.USE_H1 || 1),              // 1 = H1 trend must agree, 0 = ignore H1
-  zone: Number(process.env.ZONE || 0.5),            // level retest zone in ATR
+  h1: Number(process.env.USE_H1 || 0),              // 1 = H1 trend must agree, 0 = ignore H1
+  zone: Number(process.env.ZONE || 1),              // level retest zone in ATR
   slbuf: Number(process.env.SL_BUF || 0.3),         // stop buffer in ATR
   maxAtr: Number(process.env.MAX_ATR_MULT || 3),    // stop cannot exceed this many ATR
   maxPerDay: Number(process.env.MAX_PER_DAY || 3),  // max signals per UTC day
   cooldown: Number(process.env.COOLDOWN || 4),      // candles to wait after a signal
-  friCutoff: Number(process.env.FRI_CUTOFF_UTC || 18)
+  friCutoff: Number(process.env.FRI_CUTOFF_UTC || 18),
+  vpf: Number(process.env.VP_FILTER || 0)           // min volume percent at the level, 0 = off
 };
 
 if (!KEY) { console.error('Set TWELVEDATA_KEY'); process.exit(1); }
@@ -58,10 +63,59 @@ function pivots(b, k, L) {
   return { ph, pl };
 }
 
+// All confirmed swing points (used by the chart)
+function allPivots(b, L) {
+  const out = [];
+  for (let p = L; p < b.length - L; p++) {
+    let okH = true, okL = true;
+    for (let i = p - L; i <= p + L; i++) {
+      if (i === p) continue;
+      if (i < p ? b[i].h > b[p].h : b[i].h >= b[p].h) okH = false;
+      if (i < p ? b[i].l < b[p].l : b[i].l <= b[p].l) okL = false;
+    }
+    if (okH) out.push({ idx: p, val: b[p].h, high: true });
+    if (okL) out.push({ idx: p, val: b[p].l, high: false });
+  }
+  return out;
+}
+
 function trendOf(arr, fast, slow) {
   const c = arr.map(x => x.c), sl = Math.min(slow, c.length - 1);
   const ef = ema(c, fast), es = ema(c, sl), last = c[c.length - 1];
   return ef > es && last > ef ? 'BUY' : ef < es && last < ef ? 'SELL' : 'NONE';
+}
+
+// Volume profile (same idea as ChartPrime). Uses API volume if present, else counts candles.
+function profile(arr, period, nBins) {
+  const w = arr.slice(-period);
+  let H = -Infinity, L = Infinity;
+  w.forEach(b => { if (b.h > H) H = b.h; if (b.l < L) L = b.l; });
+  let size = (H - L) / nBins;
+  if (!(size > 0)) size = 0.01;
+  const hasVol = w.some(b => b.vol > 0);
+  const bins = new Array(nBins).fill(0);
+  let delta = 0;
+  w.forEach(b => {
+    const v = hasVol ? b.vol : 1;
+    delta += b.c > b.o ? v : -v;
+    for (let i = 0; i < nBins; i++) {
+      const lo = L + size * i, hi = lo + size;
+      if (b.c >= lo - size && b.c < hi + size) bins[i] += v;
+    }
+  });
+  let max = 0, mi = 0;
+  bins.forEach((v, i) => { if (v > max) { max = v; mi = i; } });
+  return { low: L, high: H, size, bins, max, poc: L + size * (mi + 0.5), delta, hasVol };
+}
+
+function volPct(pr, price) {
+  let best = 0;
+  if (!(pr.max > 0)) return 0;
+  for (let i = 0; i < pr.bins.length; i++) {
+    const mid = pr.low + pr.size * (i + 0.5);
+    if (Math.abs(mid - price) <= pr.size) best = Math.max(best, pr.bins[i] / pr.max * 100);
+  }
+  return best;
 }
 
 // ---------- data ----------
@@ -75,7 +129,8 @@ async function candles(interval, size, ms) {
   return j.values.reverse()
     .map(v => ({
       t: Date.parse(v.datetime.replace(' ', 'T') + 'Z'),
-      o: +v.open, h: +v.high, l: +v.low, c: +v.close
+      o: +v.open, h: +v.high, l: +v.low, c: +v.close,
+      vol: v.volume !== undefined && isFinite(+v.volume) ? +v.volume : 0
     }))
     .filter(b => b.t + ms <= now); // closed candles only
 }
@@ -126,17 +181,29 @@ function analyze(B, H4, H1, nowMs, C) {
     sl = Math.max(last.h, pv.ph === null ? last.h : pv.ph) + a * C.slbuf;
     risk = sl - last.c;
   }
+
+  // Optional: the swing level must sit on a high-volume zone of the volume profile
+  let vpOk = true, vpNote = '';
+  if (C.vpf > 0 && dir !== 'NONE') {
+    const lv = dir === 'BUY' ? pv.pl : pv.ph;
+    const vp = profile(B, B.length, VP_BINS);
+    const pct = lv === null ? 0 : volPct(vp, lv);
+    vpOk = pct >= C.vpf;
+    vpNote = 'Level volume ' + Math.round(pct) + '% (min ' + C.vpf + '%)';
+  }
+
   if (dir !== 'NONE') {
     maxRisk = Math.min(a * C.maxAtr, C.maxDist / C.rr2);
     rOk = risk >= minRisk && risk <= maxRisk;
     checks.push({ name: 'Level retest', pass: lvl, note: dir === 'BUY' ? 'Swing low ' + pv.pl : 'Swing high ' + pv.ph });
+    if (C.vpf > 0) checks.push({ name: 'Volume level', pass: vpOk, note: vpNote });
     checks.push({ name: 'Candle', pass: cnd, note: 'Pin bar or engulfing' });
     checks.push({ name: 'Risk size', pass: rOk, note: 'Stop ' + risk.toFixed(2) + ' (min ' + minRisk.toFixed(2) + ', max ' + maxRisk.toFixed(2) + ')' });
   }
   checks.push({ name: 'Session', pass: sessOk, note: !weekdayOk ? 'Weekend, market closed' : !fridayOk ? 'Friday cutoff' : 'UTC ' + SESSION[0] + ':00 to ' + SESSION[1] + ':00' });
   checks.push({ name: 'News', pass: newsOk, note: newsOk ? 'No blocked window' : 'Inside news window' });
 
-  const ok = fresh && dir !== 'NONE' && h1ok && atrOk && lvl && cnd && rOk && sessOk && newsOk;
+  const ok = fresh && dir !== 'NONE' && h1ok && atrOk && lvl && vpOk && cnd && rOk && sessOk && newsOk;
   const e = last.c, s = dir === 'BUY' ? 1 : -1;
   return {
     signal: ok ? dir : 'NO TRADE',
@@ -237,7 +304,7 @@ async function loadBtData() {
 function cfgFromUrl(url) {
   const q = new URL(url, 'http://x').searchParams;
   const cfg = Object.assign({}, DEF);
-  const map = { maxdist: 'maxDist', rr1: 'rr1', rr2: 'rr2', spread: 'spread', minatr: 'minAtr', h1: 'h1', zone: 'zone', slbuf: 'slbuf', maxatr: 'maxAtr' };
+  const map = { maxdist: 'maxDist', rr1: 'rr1', rr2: 'rr2', spread: 'spread', minatr: 'minAtr', h1: 'h1', zone: 'zone', slbuf: 'slbuf', maxatr: 'maxAtr', vpf: 'vpf' };
   Object.keys(map).forEach(k => {
     if (q.has(k) && q.get(k) !== '' && !isNaN(Number(q.get(k)))) cfg[map[k]] = Number(q.get(k));
   });
@@ -363,6 +430,44 @@ async function sweep() {
   return data;
 }
 
+// ---------- chart data (volume profile and pivot levels) ----------
+function chartData() {
+  const B = chartB;
+  if (!B || B.length < 60) return null;
+  const period = Math.min(VP_PERIOD, B.length);
+  const w = B.slice(-period);
+  const base = B.length - period;
+  const showN = Math.min(120, B.length);
+  const showStart = B.length - showN;
+  const prof = profile(w, w.length, VP_BINS);
+
+  const levels = [];
+  allPivots(w, PIVOT_LEN).forEach(p => {
+    const pct = volPct(prof, p.val);
+    if (pct < PIVOT_FILTER) return;
+    let to = null;
+    for (let j = p.idx + 1; j < w.length; j++) {
+      if (w[j].l < p.val && w[j].h > p.val) { to = j; break; }
+    }
+    levels.push({
+      price: +p.val.toFixed(2), high: p.high, pct: Math.round(pct),
+      from: base + p.idx - showStart, to: to === null ? null : base + to - showStart, idx: p.idx
+    });
+  });
+  levels.sort((a, b) => b.idx - a.idx);
+
+  const sig = state.signal === 'BUY' || state.signal === 'SELL'
+    ? { dir: state.signal, entry: state.entry, sl: state.sl, tp1: state.tp1, tp2: state.tp2 } : null;
+
+  return {
+    period,
+    candles: B.slice(-showN).map(b => ({ t: b.t, o: b.o, h: b.h, l: b.l, c: b.c })),
+    prof: { low: prof.low, high: prof.high, size: prof.size, bins: prof.bins, max: prof.max, poc: prof.poc, delta: prof.delta, hasVol: prof.hasVol },
+    levels: levels.slice(0, 12),
+    signal: sig
+  };
+}
+
 // ---------- alerts ----------
 async function notify(s) {
   const f = x => x.toFixed(2);
@@ -382,16 +487,18 @@ async function notify(s) {
 
 // ---------- loop ----------
 let state = { signal: 'STARTING', checks: [] };
-let trades = [], lastBoundary = 0, lastAlertT = 0;
+let trades = [], lastBoundary = 0, lastAlertT = 0, chartB = null;
 
 async function refresh() {
   try {
-    const [B, H4, H1] = await Promise.all([
-      candles('15min', 150, BAR),
+    const [Bfull, H4, H1] = await Promise.all([
+      candles('15min', 250, BAR),
       candles('4h', 260, 4 * 3600000),
       candles('1h', 120, 3600000)
     ]);
+    const B = Bfull.slice(-150);
     if (B.length < 40 || H4.length < 60 || H1.length < 60) throw new Error('Not enough candles from API');
+    chartB = Bfull;
 
     // update open trades
     trades.forEach(tr => {
@@ -450,8 +557,10 @@ dl{display:grid;grid-template-columns:auto 1fr;gap:4px 14px}dt{color:#93a3b5}dd{
 li{list-style:none;padding:6px 0;border-top:1px solid #2b3a4c}ul{padding:0;margin:8px 0 0}
 .p{color:#4cc98a}.f{color:#ff8077}.m{color:#93a3b5;font-size:.85rem}
 a{color:#7fb4ff}
+canvas{display:block;width:100%;height:340px}
 </style></head><body><main>
 <h1>XAUUSD Live Signal</h1><div id="o" class="c">Loading...</div>
+<div class="c"><b>M15 chart with volume profile</b><canvas id="cv"></canvas><div id="vi" class="m"></div></div>
 <div id="t" class="c"></div>
 <p class="m"><a href="/api/backtest">Run backtest</a> | <a href="/api/sweep">Run sweep</a> (takes a few seconds). Checks the last closed M15 candle. Education only, not financial advice.</p>
 <script>
@@ -466,7 +575,33 @@ document.getElementById('o').innerHTML=h;
 var st=s.stats||{};
 var t='<b>Live results since server start</b><div class="m">Trades '+(st.trades||0)+' | Win rate '+(st.winRate||0)+'% | Total '+(st.totalR||0)+'R | Max drawdown '+(st.maxDrawdownR||0)+'R</div><ul>'+(s.trades||[]).slice(0,10).map(function(x){return '<li><b class="'+(x.dir==='BUY'?'BUY':'SELL')+'">'+x.dir+'</b> '+f(x.entry)+' <span class="m">'+(x.done?(x.out+' '+f(x.r)+'R'):(x.stage===1?'Open, TP1 hit':'Open'))+'</span></li>'}).join('')+'</ul>';
 document.getElementById('t').innerHTML=t})}
-load();setInterval(load,30000);
+
+function draw(d){
+var cv=document.getElementById('cv');var dpr=window.devicePixelRatio||1;
+var w=cv.clientWidth,h=340;cv.width=w*dpr;cv.height=h*dpr;
+var x=cv.getContext('2d');x.setTransform(dpr,0,0,dpr,0,0);x.clearRect(0,0,w,h);
+var c=d.candles,n=c.length,i;if(!n){return}
+var lo=1e12,hi=-1e12;
+for(i=0;i<n;i++){if(c[i].l<lo)lo=c[i].l;if(c[i].h>hi)hi=c[i].h}
+var sg=d.signal;
+if(sg){[sg.entry,sg.sl,sg.tp1,sg.tp2].forEach(function(v){if(v<lo)lo=v;if(v>hi)hi=v})}
+var pad=(hi-lo)*0.04;lo-=pad;hi+=pad;
+var top=10,bot=14,axisW=48,plotW=Math.floor((w-axisW)*0.74),profX=plotW+4,profW=w-axisW-profX;
+function Y(p){return top+(hi-p)/(hi-lo)*(h-top-bot)}
+var step=plotW/n,pr=d.prof;
+x.fillStyle='rgba(127,180,255,0.35)';
+for(i=0;i<pr.bins.length;i++){var b0=pr.low+pr.size*i,b1=b0+pr.size;if(b1<lo||b0>hi)continue;var len=pr.bins[i]/pr.max*profW;var y1=Y(Math.min(b1,hi)),y0=Y(Math.max(b0,lo));x.fillRect(profX,y1,len,Math.max(1,y0-y1-1))}
+for(i=0;i<n;i++){var k=c[i],up=k.c>=k.o,cx=i*step+step/2;x.strokeStyle=up?'#4cc98a':'#ff8077';x.fillStyle=x.strokeStyle;x.beginPath();x.moveTo(cx,Y(k.h));x.lineTo(cx,Y(k.l));x.stroke();var yo=Y(k.o),yc=Y(k.c);x.fillRect(cx-step*0.3,Math.min(yo,yc),step*0.6,Math.max(1,Math.abs(yo-yc)))}
+x.font='10px sans-serif';
+d.levels.forEach(function(lv){if(lv.price<lo||lv.price>hi)return;var x1=Math.max(0,lv.from)*step,x2=(lv.to===null?n:Math.min(n,Math.max(0,lv.to)))*step;if(x2<=x1)return;x.strokeStyle=lv.high?'#c0504d':'#2aa198';x.lineWidth=lv.to===null?2:1;x.setLineDash(lv.to===null?[]:[4,3]);x.beginPath();x.moveTo(x1,Y(lv.price));x.lineTo(x2,Y(lv.price));x.stroke();x.setLineDash([]);x.lineWidth=1;x.fillStyle=x.strokeStyle;x.fillText(lv.pct+'%',x1+2,Y(lv.price)-2)});
+x.strokeStyle=pr.delta>0?'#4cc98a':'#c0504d';x.lineWidth=2;x.beginPath();x.moveTo(0,Y(pr.poc));x.lineTo(w-axisW,Y(pr.poc));x.stroke();x.lineWidth=1;x.fillStyle=x.strokeStyle;x.fillText('POC '+pr.poc.toFixed(2),4,Y(pr.poc)-3);
+if(sg){[['Entry',sg.entry,'#e8eef5'],['SL',sg.sl,'#ff8077'],['TP1',sg.tp1,'#4cc98a'],['TP2',sg.tp2,'#4cc98a']].forEach(function(a){x.strokeStyle=a[2];x.setLineDash([6,4]);x.beginPath();x.moveTo(0,Y(a[1]));x.lineTo(w-axisW,Y(a[1]));x.stroke();x.setLineDash([]);x.fillStyle=a[2];x.fillText(a[0],plotW-34,Y(a[1])-2)})}
+x.fillStyle='#93a3b5';
+for(i=0;i<=4;i++){var pp=lo+(hi-lo)*i/4;x.fillText(pp.toFixed(1),w-axisW+4,Y(pp)+3)}
+document.getElementById('vi').textContent='Volume profile of last '+d.period+' candles | POC '+pr.poc.toFixed(2)+' | Net flow '+(pr.delta>0?'buying':'selling')+' | Source: '+(pr.hasVol?'API volume':'candle count (API gives no volume)')+' | Level labels show volume %'}
+
+function loadChart(){fetch('/api/chart').then(function(r){return r.json()}).then(function(d){if(d&&d.candles){draw(d)}})}
+load();loadChart();setInterval(load,30000);setInterval(loadChart,60000);
 </script></main></body></html>`;
 
 function sendJson(res, code, obj) {
@@ -477,6 +612,10 @@ function sendJson(res, code, obj) {
 http.createServer(async (req, res) => {
   if (req.url.startsWith('/api/signal')) {
     return sendJson(res, 200, Object.assign({}, state, { trades, stats: stats(trades) }));
+  }
+  if (req.url.startsWith('/api/chart')) {
+    try { return sendJson(res, 200, chartData() || { error: 'Not ready yet' }); }
+    catch (e) { return sendJson(res, 500, { error: e.message }); }
   }
   if (req.url.startsWith('/api/backtest')) {
     try { return sendJson(res, 200, await backtest(cfgFromUrl(req.url))); }

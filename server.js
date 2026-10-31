@@ -1,4 +1,4 @@
-// XAUUSD signal server v2. Node 18+, no dependencies.
+// XAUUSD signal server v2.1 (with backtest funnel). Node 18+, no dependencies.
 const http = require('http');
 
 const KEY = process.env.TWELVEDATA_KEY;
@@ -137,6 +137,9 @@ function analyze(B, H4, H1, nowMs) {
     sl: ok ? sl : null,
     tp1: ok ? e + s * risk * RR1 : null,
     tp2: ok ? e + s * risk * RR2 : null,
+    riskVal: dir !== 'NONE' ? risk : null,
+    maxRisk: maxRisk,
+    minRisk: minRisk,
     checks,
     updated: new Date().toISOString()
   };
@@ -203,6 +206,13 @@ async function backtest() {
     candles('1h', 3000, 3600000)
   ]);
   const trades = [], perDay = {};
+  // Funnel: counts only candles inside the trading session, to show which filter blocks signals.
+  const funnel = {
+    candlesChecked: 0, sessionCandles: 0,
+    trendH4: 0, trendH1: 0, volatility: 0, levelRetest: 0, candlePattern: 0, riskSize: 0,
+    levelAndCandle: 0, trendLevelCandle: 0,
+    levelCandleButRiskTooBig: 0, levelCandleButRiskTooSmall: 0, levelCandleRiskOk: 0
+  };
   let i = 200;
   while (i < B.length - 2) {
     const w = B.slice(i - 149, i + 1);
@@ -210,6 +220,26 @@ async function backtest() {
     const h4 = upto(H4, 4 * 3600000, t, 260), h1 = upto(H1, 3600000, t, 120);
     if (h4.length < 60 || h1.length < 60) { i++; continue; }
     const sg = analyze(w, h4, h1, t);
+
+    funnel.candlesChecked++;
+    const pass = n => { const c = sg.checks.find(x => x.name === n); return !!(c && c.pass); };
+    if (pass('Session')) {
+      funnel.sessionCandles++;
+      if (pass('Trend (H4)')) funnel.trendH4++;
+      if (pass('Trend (H1)')) funnel.trendH1++;
+      if (pass('Volatility')) funnel.volatility++;
+      if (pass('Level retest')) funnel.levelRetest++;
+      if (pass('Candle')) funnel.candlePattern++;
+      if (pass('Risk size')) funnel.riskSize++;
+      if (pass('Level retest') && pass('Candle')) {
+        funnel.levelAndCandle++;
+        if (pass('Trend (H4)') && pass('Trend (H1)')) funnel.trendLevelCandle++;
+        if (sg.riskVal > sg.maxRisk) funnel.levelCandleButRiskTooBig++;
+        else if (sg.riskVal < sg.minRisk) funnel.levelCandleButRiskTooSmall++;
+        else funnel.levelCandleRiskOk++;
+      }
+    }
+
     const dk = new Date(t).toISOString().slice(0, 10);
     if (sg.signal !== 'NO TRADE' && (perDay[dk] || 0) < MAX_PER_DAY) {
       const tr = { dir: sg.signal, entry: sg.entry, sl: sg.sl, tp1: sg.tp1, tp2: sg.tp2 };
@@ -227,6 +257,7 @@ async function backtest() {
     from: new Date(B[0].t).toISOString(),
     to: new Date(B[B.length - 1].t).toISOString(),
     summary: stats(trades),
+    funnel,
     last30: trades.slice(-30)
   };
   btCache = { at: Date.now(), data };

@@ -1,4 +1,4 @@
-// XAUUSD signal server v2.2 (tunable backtest). Node 18+, no dependencies.
+// XAUUSD signal server v2.3 (sweep with train/test split). Node 18+, no dependencies.
 const http = require('http');
 
 const KEY = process.env.TWELVEDATA_KEY;
@@ -11,8 +11,7 @@ const SESSION = (process.env.SESSION_UTC || '7-20').split('-').map(Number);
 const NEWS = (process.env.NEWS_BLOCKS || '').split(',').map(s => s.trim()).filter(Boolean);
 const BAR = 15 * 60000;
 
-// Default settings. The backtest link can override most of them, for example:
-// /api/backtest?h1=0&zone=1&rr1=1.5&rr2=2&maxdist=10
+// Default settings. Backtest and sweep links can override them.
 const DEF = {
   maxDist: Number(process.env.MAX_DIST || 10),      // max price distance for SL and TP2
   rr1: Number(process.env.RR1 || 1.5),              // TP1 as multiple of risk
@@ -212,6 +211,7 @@ const upto = (arr, ms, t, n) => arr.filter(b => b.t + ms <= t).slice(-n);
 const pick = (arr, p) => arr.length ? +arr[Math.min(arr.length - 1, Math.floor(arr.length * p))].toFixed(2) : null;
 let dataCache = null;
 let btCache = {};
+let sweepCache = null;
 
 async function loadBtData() {
   if (dataCache && Date.now() - dataCache.at < 3600000) return dataCache;
@@ -220,8 +220,17 @@ async function loadBtData() {
     candles('4h', 1500, 4 * 3600000),
     candles('1h', 3000, 3600000)
   ]);
-  dataCache = { at: Date.now(), B, H4, H1 };
+  // Pre-slice windows once, so each backtest run is fast.
+  const prep = [];
+  for (let i = 200; i < B.length - 2; i++) {
+    const w = B.slice(i - 149, i + 1);
+    const t = w[w.length - 1].t + BAR;
+    const h4 = upto(H4, 4 * 3600000, t, 260), h1 = upto(H1, 3600000, t, 120);
+    prep.push(h4.length < 60 || h1.length < 60 ? null : { i, w, t, h4, h1 });
+  }
+  dataCache = { at: Date.now(), B, prep };
   btCache = {};
+  sweepCache = null;
   return dataCache;
 }
 
@@ -235,77 +244,122 @@ function cfgFromUrl(url) {
   return cfg;
 }
 
-async function backtest(cfg) {
-  const key = JSON.stringify(cfg);
-  const data0 = await loadBtData();
-  if (btCache[key]) return btCache[key];
-  const { B, H4, H1 } = data0;
+function runBt(cfg, d, wantFunnel) {
+  const B = d.B, prep = d.prep;
   const trades = [], perDay = {}, riskSamples = [], atrSamples = [];
-  // Funnel counts only candles inside the trading session, to show which filter blocks signals.
   const funnel = {
     candlesChecked: 0, sessionCandles: 0,
     trendH4: 0, trendH1: 0, volatility: 0, levelRetest: 0, candlePattern: 0, riskSize: 0,
     levelAndCandle: 0, trendLevelCandle: 0,
     levelCandleButRiskTooBig: 0, levelCandleButRiskTooSmall: 0, levelCandleRiskOk: 0
   };
-  let i = 200;
-  while (i < B.length - 2) {
-    const w = B.slice(i - 149, i + 1);
-    const t = w[w.length - 1].t + BAR;
-    const h4 = upto(H4, 4 * 3600000, t, 260), h1 = upto(H1, 3600000, t, 120);
-    if (h4.length < 60 || h1.length < 60) { i++; continue; }
-    const sg = analyze(w, h4, h1, t, cfg);
+  let idx = 0;
+  while (idx < prep.length) {
+    const p = prep[idx];
+    if (!p) { idx++; continue; }
+    const sg = analyze(p.w, p.h4, p.h1, p.t, cfg);
 
-    funnel.candlesChecked++;
-    const pass = n => { const c = sg.checks.find(x => x.name === n); return !!(c && c.pass); };
-    if (pass('Session')) {
-      funnel.sessionCandles++;
-      if (pass('Trend (H4)')) funnel.trendH4++;
-      if (pass('Trend (H1)')) funnel.trendH1++;
-      if (pass('Volatility')) funnel.volatility++;
-      if (pass('Level retest')) funnel.levelRetest++;
-      if (pass('Candle')) funnel.candlePattern++;
-      if (pass('Risk size')) funnel.riskSize++;
-      if (pass('Level retest') && pass('Candle')) {
-        funnel.levelAndCandle++;
-        riskSamples.push(sg.riskVal);
-        atrSamples.push(sg.atrVal);
-        if (pass('Trend (H4)') && pass('Trend (H1)')) funnel.trendLevelCandle++;
-        if (sg.riskVal > sg.maxRisk) funnel.levelCandleButRiskTooBig++;
-        else if (sg.riskVal < sg.minRisk) funnel.levelCandleButRiskTooSmall++;
-        else funnel.levelCandleRiskOk++;
+    if (wantFunnel) {
+      funnel.candlesChecked++;
+      const pass = n => { const c = sg.checks.find(x => x.name === n); return !!(c && c.pass); };
+      if (pass('Session')) {
+        funnel.sessionCandles++;
+        if (pass('Trend (H4)')) funnel.trendH4++;
+        if (pass('Trend (H1)')) funnel.trendH1++;
+        if (pass('Volatility')) funnel.volatility++;
+        if (pass('Level retest')) funnel.levelRetest++;
+        if (pass('Candle')) funnel.candlePattern++;
+        if (pass('Risk size')) funnel.riskSize++;
+        if (pass('Level retest') && pass('Candle')) {
+          funnel.levelAndCandle++;
+          riskSamples.push(sg.riskVal);
+          atrSamples.push(sg.atrVal);
+          if (pass('Trend (H4)') && pass('Trend (H1)')) funnel.trendLevelCandle++;
+          if (sg.riskVal > sg.maxRisk) funnel.levelCandleButRiskTooBig++;
+          else if (sg.riskVal < sg.minRisk) funnel.levelCandleButRiskTooSmall++;
+          else funnel.levelCandleRiskOk++;
+        }
       }
     }
 
-    const dk = new Date(t).toISOString().slice(0, 10);
-    if (sg.signal !== 'NO TRADE' && (perDay[dk] || 0) < cfg.maxPerDay) {
-      const tr = { dir: sg.signal, entry: sg.entry, sl: sg.sl, tp1: sg.tp1, tp2: sg.tp2 };
-      const res = evalTrade(tr, B.slice(i + 1, i + 97), 96, cfg);
-      if (!res.done) break;
-      perDay[dk] = (perDay[dk] || 0) + 1;
-      trades.push({ time: sg.candle, dir: tr.dir, entry: +tr.entry.toFixed(2), sl: +tr.sl.toFixed(2), out: res.out, r: +res.r.toFixed(2), done: true });
-      i += res.bars + cfg.cooldown;
-    } else {
-      i++;
+    if (sg.signal !== 'NO TRADE') {
+      const dk = new Date(p.t).toISOString().slice(0, 10);
+      if ((perDay[dk] || 0) < cfg.maxPerDay) {
+        const tr = { dir: sg.signal, entry: sg.entry, sl: sg.sl, tp1: sg.tp1, tp2: sg.tp2 };
+        const res = evalTrade(tr, B.slice(p.i + 1, p.i + 97), 96, cfg);
+        if (!res.done) break;
+        perDay[dk] = (perDay[dk] || 0) + 1;
+        trades.push({ time: sg.candle, tms: sg.candleTime, dir: tr.dir, entry: +tr.entry.toFixed(2), sl: +tr.sl.toFixed(2), out: res.out, r: +res.r.toFixed(2), done: true });
+        idx += res.bars + cfg.cooldown;
+        continue;
+      }
     }
+    idx++;
   }
-  riskSamples.sort((x, y) => x - y);
-  atrSamples.sort((x, y) => x - y);
-  funnel.riskStats = {
+  return { trades, funnel, riskSamples, atrSamples };
+}
+
+async function backtest(cfg) {
+  const key = JSON.stringify(cfg);
+  const d = await loadBtData();
+  if (btCache[key]) return btCache[key];
+  const r = runBt(cfg, d, true);
+  r.riskSamples.sort((x, y) => x - y);
+  r.atrSamples.sort((x, y) => x - y);
+  r.funnel.riskStats = {
     note: 'Stop distance of candles that had level retest and candle pattern',
-    min: pick(riskSamples, 0), median: pick(riskSamples, 0.5), p75: pick(riskSamples, 0.75), max: pick(riskSamples, 0.999),
-    atrMedian: pick(atrSamples, 0.5)
+    min: pick(r.riskSamples, 0), median: pick(r.riskSamples, 0.5), p75: pick(r.riskSamples, 0.75), max: pick(r.riskSamples, 0.999),
+    atrMedian: pick(r.atrSamples, 0.5)
   };
   const data = {
     note: 'Backtest on recent M15 candles. Includes spread cost. Past results do not guarantee future results. Under 30 trades is too few to trust.',
     config: cfg,
-    from: new Date(B[0].t).toISOString(),
-    to: new Date(B[B.length - 1].t).toISOString(),
-    summary: stats(trades),
-    funnel,
-    last30: trades.slice(-30)
+    from: new Date(d.B[0].t).toISOString(),
+    to: new Date(d.B[d.B.length - 1].t).toISOString(),
+    summary: stats(r.trades),
+    funnel: r.funnel,
+    last30: r.trades.slice(-30)
   };
   btCache[key] = data;
+  return data;
+}
+
+// ---------- sweep: many settings at once, with train/test split ----------
+const fmt = s => 'n=' + s.trades + ' win' + s.winRate + '% R' + s.totalR + ' PF' + (s.profitFactor === null ? '-' : s.profitFactor) + ' DD' + s.maxDrawdownR;
+
+async function sweep() {
+  const d = await loadBtData();
+  if (sweepCache) return sweepCache;
+  const splitT = d.B[Math.floor(d.B.length * 0.7)].t;
+  const rrs = [[1.5, 2], [1, 2], [2, 3]];
+  const rows = [];
+  [20, 30].forEach(md => [0, 1].forEach(h1 => [0.5, 1, 1.5].forEach(zn => rrs.forEach(rr => {
+    const cfg = Object.assign({}, DEF, { maxDist: md, h1: h1, zone: zn, rr1: rr[0], rr2: rr[1] });
+    const r = runBt(cfg, d, false);
+    const tr = r.trades.filter(x => x.tms < splitT), te = r.trades.filter(x => x.tms >= splitT);
+    rows.push({
+      q: '?maxdist=' + md + '&h1=' + h1 + '&zone=' + zn + '&rr1=' + rr[0] + '&rr2=' + rr[1],
+      label: 'maxdist ' + md + ' | h1 ' + h1 + ' | zone ' + zn + ' | rr ' + rr[0] + '/' + rr[1],
+      all: stats(r.trades), train: stats(tr), test: stats(te)
+    });
+  }))));
+  const eligible = rows.filter(r => r.train.trades >= 10 && r.test.trades >= 5);
+  eligible.sort((a, b) => Math.min(b.train.totalR, b.test.totalR) - Math.min(a.train.totalR, a.test.totalR));
+  const both = eligible.filter(r => r.train.totalR > 0 && r.test.totalR > 0);
+  const byAll = rows.slice().sort((a, b) => b.all.totalR - a.all.totalR).slice(0, 5);
+  const data = {
+    note: 'Ranked by the weaker of train and test result. Train is the first 70% of candles, test is the last 30%. Only settings with at least 10 train and 5 test trades are ranked. Under 30 trades in total is weak evidence.',
+    from: new Date(d.B[0].t).toISOString(),
+    splitAt: new Date(splitT).toISOString(),
+    to: new Date(d.B[d.B.length - 1].t).toISOString(),
+    tested: rows.length,
+    ranked: eligible.length,
+    profitableOnBoth: both.length,
+    top: eligible.slice(0, 8).map(r => r.label + ' || TRAIN ' + fmt(r.train) + ' || TEST ' + fmt(r.test)),
+    topLinks: eligible.slice(0, 8).map(r => '/api/backtest' + r.q),
+    mostTotalRAllTrades: byAll.map(r => r.label + ' || ALL ' + fmt(r.all))
+  };
+  sweepCache = data;
   return data;
 }
 
@@ -399,7 +453,7 @@ a{color:#7fb4ff}
 </style></head><body><main>
 <h1>XAUUSD Live Signal</h1><div id="o" class="c">Loading...</div>
 <div id="t" class="c"></div>
-<p class="m"><a href="/api/backtest">Run backtest</a> (takes a few seconds). Checks the last closed M15 candle. Education only, not financial advice.</p>
+<p class="m"><a href="/api/backtest">Run backtest</a> | <a href="/api/sweep">Run sweep</a> (takes a few seconds). Checks the last closed M15 candle. Education only, not financial advice.</p>
 <script>
 function f(x){return x==null?'-':x.toFixed(2)}
 function load(){fetch('/api/signal').then(function(r){return r.json()}).then(function(s){
@@ -415,20 +469,22 @@ document.getElementById('t').innerHTML=t})}
 load();setInterval(load,30000);
 </script></main></body></html>`;
 
+function sendJson(res, code, obj) {
+  res.writeHead(code, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+  res.end(JSON.stringify(obj, null, 2));
+}
+
 http.createServer(async (req, res) => {
   if (req.url.startsWith('/api/signal')) {
-    res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
-    return res.end(JSON.stringify(Object.assign({}, state, { trades, stats: stats(trades) })));
+    return sendJson(res, 200, Object.assign({}, state, { trades, stats: stats(trades) }));
   }
   if (req.url.startsWith('/api/backtest')) {
-    try {
-      const data = await backtest(cfgFromUrl(req.url));
-      res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
-      return res.end(JSON.stringify(data, null, 2));
-    } catch (e) {
-      res.writeHead(500, { 'Content-Type': 'application/json' });
-      return res.end(JSON.stringify({ error: e.message }));
-    }
+    try { return sendJson(res, 200, await backtest(cfgFromUrl(req.url))); }
+    catch (e) { return sendJson(res, 500, { error: e.message }); }
+  }
+  if (req.url.startsWith('/api/sweep')) {
+    try { return sendJson(res, 200, await sweep()); }
+    catch (e) { return sendJson(res, 500, { error: e.message }); }
   }
   if (req.url === '/health') { res.writeHead(200); return res.end('ok'); }
   res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });

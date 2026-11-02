@@ -1,0 +1,38 @@
+//@version=5
+strategy("XAU EMA Pullback ATR", overlay=true, initial_capital=10000, default_qty_type=strategy.percent_of_equity, default_qty_value=10)
+
+fastLen = input.int(20, "Fast EMA")
+slowLen = input.int(50, "Slow EMA")
+atrLen  = input.int(14, "ATR Length")
+atrMult = input.float(1.5, "ATR Stop Multiplier")
+rr      = input.float(2.0, "Reward:Risk")
+secret  = input.string("change-me", "Webhook Secret")
+
+emaF = ta.ema(close, fastLen)
+emaS = ta.ema(close, slowLen)
+atr  = ta.atr(atrLen)
+
+upTrend   = emaF > emaS and close > emaS
+downTrend = emaF < emaS and close < emaS
+
+longSig  = upTrend and low <= emaF and close > emaF and close > open
+shortSig = downTrend and high >= emaF and close < emaF and close < open
+
+if longSig and strategy.position_size == 0
+    stopP = close - atr * atrMult
+    tpP   = close + (close - stopP) * rr
+    msg = '{"secret":"' + secret + '","symbol":"XAUUSD","side":"buy","sl":' + str.tostring(stopP, "#.##") + ',"tp":' + str.tostring(tpP, "#.##") + '}'
+    strategy.entry("Long", strategy.long, alert_message=msg)
+    strategy.exit("Long Exit", "Long", stop=stopP, limit=tpP)
+
+if shortSig and strategy.position_size == 0
+    stopP = close + atr * atrMult
+    tpP   = close - (stopP - close) * rr
+    msg = '{"secret":"' + secret + '","symbol":"XAUUSD","side":"sell","sl":' + str.tostring(stopP, "#.##") + ',"tp":' + str.tostring(tpP, "#.##") + '}'
+    strategy.entry("Short", strategy.short, alert_message=msg)
+    strategy.exit("Short Exit", "Short", stop=stopP, limit=tpP)
+
+plot(emaF, "Fast EMA", color=color.orange)
+plot(emaS, "Slow EMA", color=color.blue)
+plotshape(longSig, style=shape.triangleup, location=location.belowbar, color=color.green, size=size.small)
+plotshape(shortSig, style=shape.triangledown, location=location.abovebar, color=color.red, size=size.small)

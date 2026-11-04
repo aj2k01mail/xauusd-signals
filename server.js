@@ -2,9 +2,9 @@ const express = require("express");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const TD_KEY = process.env.TD_KEY || "";
-const NTFY_TOPIC = process.env.NTFY_TOPIC || "";
-const CRON_KEY = process.env.CRON_KEY || "";
+const TD_KEY = (process.env.TD_KEY || "").trim();
+const NTFY_TOPIC = (process.env.NTFY_TOPIC || "").trim();
+const CRON_KEY = (process.env.CRON_KEY || "").trim();
 
 const SYMBOL = "XAU/USD";
 const INTERVAL = "15min";
@@ -51,11 +51,21 @@ function atr(c, len) {
 }
 
 async function notify(title, message) {
-  await fetch("https://ntfy.sh/" + NTFY_TOPIC, {
+  if (!NTFY_TOPIC) throw new Error("NTFY_TOPIC is empty");
+  const res = await fetch("https://ntfy.sh/", {
     method: "POST",
-    body: message,
-    headers: { Title: title },
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      topic: NTFY_TOPIC,
+      title: title,
+      message: message,
+    }),
   });
+  const text = await res.text();
+  if (!res.ok) {
+    throw new Error("ntfy error " + res.status + ": " + text);
+  }
+  return "ntfy ok (" + res.status + ") topic=" + NTFY_TOPIC;
 }
 
 async function getCandles() {
@@ -120,10 +130,11 @@ app.get("/", (req, res) => {
 app.get("/test", async (req, res) => {
   if (!allowed(req)) return res.status(401).send("unauthorized");
   try {
-    await notify("Test", "Server test message");
-    res.send("sent");
+    const info = await notify("Test", "Server test message");
+    res.send("sent. " + info);
   } catch (err) {
-    res.status(500).send(err.message);
+    console.log(err.message);
+    res.status(500).send("failed: " + err.message);
   }
 });
 

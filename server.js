@@ -8,15 +8,15 @@ const TG_CHAT_ID = (process.env.TELEGRAM_CHAT_ID || "").trim();
 const CRON_KEY = (process.env.CRON_KEY || "").trim();
 
 const SYMBOL = "XAU/USD";
-const LIVE_INTERVAL = "1h"; // timeframe used by /check
+const LIVE_INTERVAL = "15min"; // timeframe used by /check
 const BT_TF = "15min"; // default timeframe for /backtest and /optimize
-const BT_BARS = 12000; // about 6 months of 15min candles
+const BT_BARS = 12000; // about 4 months of 15min candles
 const TFS = ["5min", "15min", "30min", "1h"];
 const ATR_LEN = 14;
 const SPREAD = 0.3; // assumed cost per trade in price units
 
-// Live strategy settings. Replace with optimizer result later.
-const CFG = { fast: 20, slow: 50, trend: 200, atrMult: 1.5, rr: 2, from: 7, to: 17 };
+// Live strategy settings (setup #5 from the optimizer)
+const CFG = { fast: 10, slow: 100, trend: 0, atrMult: 2, rr: 1.5, from: 7, to: 17 };
 
 let lastSignal = "";
 

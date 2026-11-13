@@ -19,6 +19,8 @@ const SPREAD = 0.3; // assumed cost per trade in price units
 const CFG = { fast: 10, slow: 100, trend: 0, atrMult: 2, rr: 1.5, from: 7, to: 17 };
 
 let lastSignal = "";
+let openTrade = null; // { side, time, entry, sl, tp }
+let closedAt = ""; // time of the candle where the last trade closed
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -189,6 +191,10 @@ function stats(rs) {
   };
 }
 
+function winPct(x) {
+  return x.n ? (x.wins / x.n) * 100 : 0;
+}
+
 async function check() {
   const candles = await getCandles(320, LIVE_INTERVAL);
   candles.pop(); // drop the candle that is still forming
@@ -200,10 +206,42 @@ async function check() {
   const i = candles.length - 1;
   const c = candles[i];
 
-  const side = signalAt(candles, f, s, t, i, CFG);
+  // 1) If a trade is open, see whether SL or TP was hit after it opened
+  if (openTrade) {
+    for (let j = 0; j < candles.length; j++) {
+      const k = candles[j];
+      if (k.time <= openTrade.time) continue;
+      const hitSL = openTrade.side === "BUY" ? k.low <= openTrade.sl : k.high >= openTrade.sl;
+      const hitTP = openTrade.side === "BUY" ? k.high >= openTrade.tp : k.low <= openTrade.tp;
+      if (hitSL || hitTP) {
+        const res = hitSL ? "SL hit" : "TP hit";
+        await notify(
+          "XAUUSD " + openTrade.side + " closed: " + res,
+          "Entry: " + openTrade.entry.toFixed(2) + "\n" +
+          "SL: " + openTrade.sl.toFixed(2) + "\n" +
+          "TP: " + openTrade.tp.toFixed(2) + "\n" +
+          "Candle: " + k.time
+        );
+        closedAt = k.time;
+        openTrade = null;
+        break;
+      }
+    }
+  }
+  if (openTrade) {
+    return (
+      "Trade open, no new signal. " + openTrade.side +
+      " entry " + openTrade.entry.toFixed(2) +
+      " SL " + openTrade.sl.toFixed(2) +
+      " TP " + openTrade.tp.toFixed(2)
+    );
+  }
+
+  // 2) No open trade: look for a new signal (only after the last trade closed)
+  const side = c.time > closedAt ? signalAt(candles, f, s, t, i, CFG) : null;
 
   let result = "No signal. Last closed candle: " + c.time;
-  if (side && lastSignal !== c.time) {
+  if (side && lastSignal !== c.time && a[i] !== null) {
     const risk = a[i] * CFG.atrMult;
     const sl = side === "BUY" ? c.close - risk : c.close + risk;
     const tp = side === "BUY" ? c.close + risk * CFG.rr : c.close - risk * CFG.rr;
@@ -214,6 +252,7 @@ async function check() {
       "TP: " + tp.toFixed(2);
     await notify("XAUUSD " + side, msg);
     lastSignal = c.time;
+    openTrade = { side: side, time: c.time, entry: c.close, sl: sl, tp: tp };
     result = msg;
   }
   return result;
@@ -222,7 +261,7 @@ async function check() {
 function line(label, x) {
   return (
     label + " n=" + x.n +
-    " win=" + (x.n ? ((x.wins / x.n) * 100).toFixed(0) : 0) + "%" +
+    " win=" + winPct(x).toFixed(0) + "%" +
     " exp=" + x.exp.toFixed(2) + "R" +
     " tot=" + x.tot.toFixed(1) + "R" +
     " dd=" + x.dd.toFixed(1) + "R"
@@ -248,7 +287,7 @@ async function backtest(tf, bars) {
   );
 }
 
-async function optimize(tf, bars) {
+async function optimize(tf, bars, minWin) {
   const candles = await getCandles(bars, tf);
   const closes = candles.map((c) => c.close);
   const E = {};
@@ -265,8 +304,8 @@ async function optimize(tf, bars) {
   for (const fast of [10, 20]) {
     for (const slow of [50, 100]) {
       for (const trend of [0, 200]) {
-        for (const atrMult of [1, 1.5, 2]) {
-          for (const rr of [1.5, 2, 3]) {
+        for (const atrMult of [1, 1.5, 2, 3]) {
+          for (const rr of [0.5, 0.75, 1, 1.5, 2, 3]) {
             for (const sess of sessions) {
               const p = {
                 fast: fast, slow: slow, trend: trend,
@@ -283,7 +322,10 @@ async function optimize(tf, bars) {
     }
   }
 
-  const passes = (x) => x.tr.n >= 30 && x.te.n >= 12 && x.tr.exp > 0 && x.te.exp > 0;
+  const passes = (x) =>
+    x.tr.n >= 30 && x.te.n >= 12 &&
+    x.tr.exp > 0 && x.te.exp > 0 &&
+    winPct(x.tr) >= minWin && winPct(x.te) >= minWin;
   const good = all
     .filter(passes)
     .sort((x, y) => y.tr.exp + y.te.exp - (x.tr.exp + x.te.exp))
@@ -295,10 +337,11 @@ async function optimize(tf, bars) {
     "Data: " + candles[0].time + " to " + candles[candles.length - 1].time + "\n" +
     "Train until: " + candles[split].time + " (then test)\n" +
     "Spread cost: " + SPREAD + "\n" +
-    "Tested: " + all.length + " combos. Profitable in BOTH train and test: " +
+    "Min win rate (train and test): " + minWin + "%\n" +
+    "Tested: " + all.length + " combos. Profitable in BOTH train and test with that win rate: " +
     all.filter(passes).length + "\n\n";
   if (!good.length) {
-    out += "No setup was profitable in both periods.";
+    out += "No setup met the win rate and profit rules in both periods.";
     return out;
   }
   good.forEach((x, k) => {
@@ -319,7 +362,9 @@ function btOpts(req) {
   let bars = parseInt(req.query.bars, 10);
   if (!bars || bars < 500) bars = BT_BARS;
   if (bars > 20000) bars = 20000;
-  return { tf: tf, bars: bars };
+  let minWin = parseFloat(req.query.minwin);
+  if (isNaN(minWin) || minWin < 0) minWin = 0;
+  return { tf: tf, bars: bars, minWin: minWin };
 }
 
 app.get("/", (req, res) => {
@@ -362,7 +407,7 @@ app.get("/optimize", async (req, res) => {
   if (!allowed(req)) return res.status(401).send("unauthorized");
   try {
     const o = btOpts(req);
-    res.type("text/plain").send(await optimize(o.tf, o.bars));
+    res.type("text/plain").send(await optimize(o.tf, o.bars, o.minWin));
   } catch (err) {
     console.log(err.message);
     res.status(500).send(err.message);

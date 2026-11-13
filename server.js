@@ -69,12 +69,12 @@ async function notify(title, message) {
   return "telegram ok (" + res.status + ")";
 }
 
-async function getCandles() {
+async function getCandles(size) {
   const url =
     "https://api.twelvedata.com/time_series?symbol=" +
     encodeURIComponent(SYMBOL) +
     "&interval=" + INTERVAL +
-    "&outputsize=120&apikey=" + TD_KEY;
+    "&outputsize=" + size + "&apikey=" + TD_KEY;
   const res = await fetch(url);
   const data = await res.json();
   if (!data.values) throw new Error("Data error: " + JSON.stringify(data));
@@ -87,8 +87,17 @@ async function getCandles() {
   }));
 }
 
+function signalAt(candles, emaF, emaS, i) {
+  const c = candles[i];
+  const up = emaF[i] > emaS[i] && c.close > emaS[i];
+  const down = emaF[i] < emaS[i] && c.close < emaS[i];
+  if (up && c.low <= emaF[i] && c.close > emaF[i] && c.close > c.open) return "BUY";
+  if (down && c.high >= emaF[i] && c.close < emaF[i] && c.close < c.open) return "SELL";
+  return null;
+}
+
 async function check() {
-  const candles = await getCandles();
+  const candles = await getCandles(120);
   candles.pop(); // drop the candle that is still forming
   const closes = candles.map((c) => c.close);
   const emaF = ema(closes, FAST);
@@ -97,17 +106,13 @@ async function check() {
   const i = candles.length - 1;
   const c = candles[i];
 
-  const up = emaF[i] > emaS[i] && c.close > emaS[i];
-  const down = emaF[i] < emaS[i] && c.close < emaS[i];
-  const longSig = up && c.low <= emaF[i] && c.close > emaF[i] && c.close > c.open;
-  const shortSig = down && c.high >= emaF[i] && c.close < emaF[i] && c.close < c.open;
+  const side = signalAt(candles, emaF, emaS, i);
 
   let result = "No signal. Last closed candle: " + c.time;
-  if ((longSig || shortSig) && lastSignal !== c.time) {
-    const side = longSig ? "BUY" : "SELL";
+  if (side && lastSignal !== c.time) {
     const risk = a[i] * ATR_MULT;
-    const sl = longSig ? c.close - risk : c.close + risk;
-    const tp = longSig ? c.close + risk * RR : c.close - risk * RR;
+    const sl = side === "BUY" ? c.close - risk : c.close + risk;
+    const tp = side === "BUY" ? c.close + risk * RR : c.close - risk * RR;
     const msg =
       side + " XAUUSD (" + INTERVAL + ")\n" +
       "Entry: " + c.close.toFixed(2) + "\n" +
@@ -118,6 +123,72 @@ async function check() {
     result = msg;
   }
   return result;
+}
+
+async function backtest() {
+  const candles = await getCandles(5000);
+  const closes = candles.map((c) => c.close);
+  const emaF = ema(closes, FAST);
+  const emaS = ema(closes, SLOW);
+  const a = atr(candles, ATR_LEN);
+
+  const trades = [];
+  let i = 100;
+  while (i < candles.length - 1) {
+    const side = signalAt(candles, emaF, emaS, i);
+    if (!side) {
+      i++;
+      continue;
+    }
+    const entry = candles[i].close;
+    const risk = a[i] * ATR_MULT;
+    const sl = side === "BUY" ? entry - risk : entry + risk;
+    const tp = side === "BUY" ? entry + risk * RR : entry - risk * RR;
+    let r = null;
+    let j = i + 1;
+    for (; j < candles.length; j++) {
+      const k = candles[j];
+      const hitSL = side === "BUY" ? k.low <= sl : k.high >= sl;
+      const hitTP = side === "BUY" ? k.high >= tp : k.low <= tp;
+      if (hitSL) {
+        r = -1;
+        break;
+      }
+      if (hitTP) {
+        r = RR;
+        break;
+      }
+    }
+    if (r === null) break;
+    trades.push({ side: side, time: candles[i].time, r: r });
+    i = j + 1;
+  }
+
+  const wins = trades.filter((t) => t.r > 0).length;
+  const losses = trades.length - wins;
+  const totalR = trades.reduce((s, t) => s + t.r, 0);
+  let eq = 0;
+  let peak = 0;
+  let maxDD = 0;
+  trades.forEach((t) => {
+    eq += t.r;
+    if (eq > peak) peak = eq;
+    if (peak - eq > maxDD) maxDD = peak - eq;
+  });
+  const winRate = trades.length ? (wins / trades.length) * 100 : 0;
+  const pf = losses ? (wins * RR) / losses : 0;
+
+  return (
+    "Backtest " + SYMBOL + " " + INTERVAL + "\n" +
+    "From: " + candles[0].time + "\n" +
+    "To: " + candles[candles.length - 1].time + "\n" +
+    "Trades: " + trades.length + "\n" +
+    "Wins: " + wins + "  Losses: " + losses + "\n" +
+    "Win rate: " + winRate.toFixed(1) + "%\n" +
+    "Total R: " + totalR.toFixed(1) + "\n" +
+    "Profit factor: " + pf.toFixed(2) + "\n" +
+    "Max drawdown: " + maxDD.toFixed(1) + " R"
+  );
 }
 
 function allowed(req) {
@@ -143,6 +214,16 @@ app.get("/check", async (req, res) => {
   if (!allowed(req)) return res.status(401).send("unauthorized");
   try {
     res.send(await check());
+  } catch (err) {
+    console.log(err.message);
+    res.status(500).send(err.message);
+  }
+});
+
+app.get("/backtest", async (req, res) => {
+  if (!allowed(req)) return res.status(401).send("unauthorized");
+  try {
+    res.type("text/plain").send(await backtest());
   } catch (err) {
     console.log(err.message);
     res.status(500).send(err.message);

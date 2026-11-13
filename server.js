@@ -2,8 +2,9 @@ const express = require("express");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const TD_KEY = (process.env.TD_KEY || "").trim();
-const NTFY_TOPIC = (process.env.NTFY_TOPIC || "").trim();
+const TD_KEY = (process.env.TWELVE_DATA_KEY || "").trim();
+const TG_TOKEN = (process.env.TELEGRAM_TOKEN || "").trim();
+const TG_CHAT_ID = (process.env.TELEGRAM_CHAT_ID || "").trim();
 const CRON_KEY = (process.env.CRON_KEY || "").trim();
 
 const SYMBOL = "XAU/USD";
@@ -51,21 +52,21 @@ function atr(c, len) {
 }
 
 async function notify(title, message) {
-  if (!NTFY_TOPIC) throw new Error("NTFY_TOPIC is empty");
-  const res = await fetch("https://ntfy.sh/", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      topic: NTFY_TOPIC,
-      title: title,
-      message: message,
-    }),
-  });
+  if (!TG_TOKEN || !TG_CHAT_ID) throw new Error("Telegram env vars missing");
+  const res = await fetch(
+    "https://api.telegram.org/bot" + TG_TOKEN + "/sendMessage",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: TG_CHAT_ID,
+        text: title + "\n" + message,
+      }),
+    }
+  );
   const text = await res.text();
-  if (!res.ok) {
-    throw new Error("ntfy error " + res.status + ": " + text);
-  }
-  return "ntfy ok (" + res.status + ") topic=" + NTFY_TOPIC;
+  if (!res.ok) throw new Error("telegram error " + res.status + ": " + text);
+  return "telegram ok (" + res.status + ")";
 }
 
 async function getCandles() {
